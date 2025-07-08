@@ -70,8 +70,8 @@ pipeline {
                         $class: 'GitSCM',
                         branches: [[name: "refs/heads/${env.pr_head_branch}"]],
                         userRemoteConfigs: [[
-                            url: "git@github.com:${env.repo_full_name}.git",
-                            credentialsId: 'sysengg-jenkins-api-token'
+                            url: "https://github.com/${env.repo_full_name}.git",
+                            credentialsId: 'consumer-github-token'
                         ]],
                         extensions: [
                             [$class: 'RelativeTargetDirectory', relativeTargetDir: env.REPO_DIR]
