@@ -21,7 +21,7 @@ pipeline {
         PATH = "$HOME/.local/bin:$PATH"
         JIRA_INSTANCE = "pharmeasy.atlassian.net"
         GRADLE_OPTS = "-Xmx2g -Xms512m -XX:MaxMetaspaceSize=512m"
-        GITHUB_CREDENTIALS_ID = 'mercury-github-token'
+        GITHUB_CREDENTIALS_ID = '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'
         JIRA_CREDENTIALS_ID = 'jira-api-user'
     }
 
