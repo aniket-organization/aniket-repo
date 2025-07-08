@@ -1,0 +1,245 @@
+pipeline {
+    agent any
+
+    parameters {
+        string(
+            name: 'REPO_NAME',
+            defaultValue: '',
+            description: 'Repository name (e.g., "bookkeeper-service") - Required for manual builds'
+            )
+        string(
+            name: 'PR_NUMBER',
+            defaultValue: '',
+            description: 'Pull Request number - Required for manual builds'
+        )
+    }
+
+    environment {
+        DEFAULT_JIRA_PREFIX = 'SCS'
+        DEFAULT_CODE_COVERAGE_THRESHOLD = 0
+        DEFAULT_LANGUAGE = 'kotlin'
+        PATH = "$HOME/.local/bin:$PATH"
+        JIRA_INSTANCE = "pharmeasy.atlassian.net"
+        GRADLE_OPTS = "-Xmx2g -Xms512m -XX:MaxMetaspaceSize=512m"
+        GITHUB_CREDENTIALS_ID = 'mercury-github-token'
+        JIRA_CREDENTIALS_ID = 'jira-api-user'
+    }
+
+    stages {
+
+        stage('Setup & Checkout') {
+            steps {
+                script {
+                    def github = load 'ci-pr-gatekeeper/shared/github.groovy'
+
+                    // Initialize build-related variables
+                    echo "🔧 Initializing Build Variables..."
+                    github.initializeBuildVariables()
+
+                    // Display build context information
+                    echo """
+📄 Build Context:
+──────────────────────────────
+🔔 PR Title:       ${env.pr_title}
+🔁 Base Branch:    ${env.pr_base_branch}
+🔀 Head Branch:    ${env.pr_head_branch}
+🔑 Commit SHA:     ${env.pr_sha}
+🔗 PR URL:         ${env.pr_url}
+📦 Repository:     ${env.repo_full_name}
+👤 Repo Owner:     ${env.repo_owner}
+📁 Repo Name:      ${env.repo_name}
+"""
+                    // Set GitHub status
+                    github.sendGitHubStatus('pending', 'Jenkins build started, in progress...')
+
+                    echo "🔧 Initializing repository variables..."
+                    github.initializeRepositoryVariables()
+
+                    // Set repo directory and log config
+                    env.REPO_DIR = "repositories/${env.repo_name}"
+                    echo """
+📁 Repository Variables:
+────────────────────────────────
+📁 Repo Path:                ${env.REPO_DIR}
+📌 JIRA Prefix:              ${env.JIRA_PREFIX}
+📌 Language:                 ${env.LANGUAGE}
+📌 Code Coverage Threshold:  ${env.CODE_COVERAGE_THRESHOLD}
+📌 Skip Commit Validation:   ${env.SKIP_COMMIT_VALIDATION}
+"""
+                    checkout([
+                        $class: 'GitSCM',
+                        branches: [[name: "refs/heads/${env.pr_head_branch}"]],
+                        userRemoteConfigs: [[
+                            url: "git@github.com:${env.repo_full_name}.git",
+                            credentialsId: 'sysengg-jenkins-api-token'
+                        ]],
+                        extensions: [
+                            [$class: 'RelativeTargetDirectory', relativeTargetDir: env.REPO_DIR]
+                        ]
+                    ])
+                }
+            }
+        }
+
+        stage('Validate PR Title') {
+            when {
+                expression { env.JIRA_PREFIX?.trim()?.length() > 0 }
+            }
+            steps {
+                script {
+                    def prefixes = env.JIRA_PREFIX.split(',').collect { it.trim() }.findAll { it }
+                    if (prefixes.isEmpty()) {
+                        error "❌ No valid JIRA prefixes found in JIRA_PREFIX. Please provide at least one (e.g., 'SCS,CPS')."
+                    }
+
+                    def prTitle = env.pr_title ?: ''
+
+                    def extractedJira = null
+
+                    // Check if PR title starts with any of the valid prefixes followed by dash and digits
+                    def matched = prefixes.any { prefix ->
+                        def pattern = ~"(?i)^(${prefix}-\\d+).*"  // case-insensitive
+                        def matcher = prTitle =~ pattern
+                        if (matcher) {
+                            extractedJira = matcher[0][1].toUpperCase()  // make uppercase here
+                            return true // stop checking further prefixes
+                        }
+                        return false
+                    }
+
+                    if (!matched) {
+                        def errorMsg = "❌ PR title must start with a JIRA ticket like: ${prefixes.collect { it + '-123' }.join(', ')}"
+                        currentBuild.description = errorMsg
+                        error errorMsg
+                    } else {
+                        env.EXTRACTED_JIRA = extractedJira
+                        echo "✅ PR title is valid."
+                        echo "Extracted JIRA ticket: ${env.EXTRACTED_JIRA}"
+                    }
+                }
+            }
+        }
+
+        stage('Validate JIRA Ticket') {
+            when {
+                expression { env.EXTRACTED_JIRA != null }
+            }
+            steps {
+                script {
+                    def credId = env.JIRA_CREDENTIALS_ID
+                    withCredentials([usernamePassword(credentialsId: credId, usernameVariable: 'JIRA_API_USER', passwordVariable: 'JIRA_API_TOKEN')]) {
+                        def jiraTicket = env.EXTRACTED_JIRA
+                        def jiraInstance = env.JIRA_INSTANCE
+
+                        echo "Validating existence of JIRA ticket: ${jiraTicket}"
+
+                        def httpStatusCode = sh(script: """
+                            set +x
+                            curl -s -o /dev/null -w "%{http_code}" -u "\$JIRA_API_USER:\$JIRA_API_TOKEN" "https://${jiraInstance}/rest/api/2/issue/${jiraTicket}"
+                        """, returnStdout: true).trim()
+
+                        echo "JIRA API response HTTP status code: ${httpStatusCode}"
+
+                        if (httpStatusCode != '200') {
+                            def errorMsg = "❌ JIRA ticket ${jiraTicket} does not exist."
+                            currentBuild.description = errorMsg
+                            error errorMsg
+                        } else {
+                            echo "✅ JIRA ticket exists."
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Validate Commit Messages') {
+            when {
+                expression { return !env.SKIP_COMMIT_VALIDATION.toBoolean() }
+            }
+            steps {
+                script {
+                    dir(env.REPO_DIR) {
+                        sh "git fetch origin ${env.pr_base_branch}"
+                        def commits = sh(
+                            script: "git log origin/${env.pr_base_branch}..${env.pr_sha} --pretty=format:%s",
+                            returnStdout: true
+                        ).trim().split("\n")
+
+                        def prefixes = env.JIRA_PREFIX.split(',').collect { it.trim() }.findAll { it }
+
+                        def allowedPrefixes = ['^Merge .*', '^Revert .*']
+
+                        // Combine all prefixes into one pattern like: (SCS|OPS)-\d+
+                        def combinedPattern = ~/(?i)\b(${prefixes.join('|')})-\d+\b/
+
+                        def invalid = commits.findAll { msg ->
+                            msg?.trim() &&  // skip empty
+                            !msg.find(combinedPattern) &&  // doesn't match any JIRA ticket pattern
+                            !allowedPrefixes.any { p -> msg ==~ p }  // not an allowed prefix
+                        }
+
+                        if (!invalid.isEmpty()) {
+                            currentBuild.description = "❌ Invalid commit messages detected"
+                            error """❌ The following commit messages must contain a valid JIRA ticket like ${prefixes.collect { it + "-123" }.join(", ")}:
+${invalid.join('\n')}
+
+💡 Tips to fix:
+- Use 'git commit --amend' to update the last commit message.
+- Use 'git rebase -i HEAD~N' to reword your last N commits.
+- Squash commits to combine and update messages.
+- Guide: https://docs.github.com/en/pull-requests/committing-changes-to-your-project/creating-and-editing-commits/changing-a-commit-message
+"""
+                        } else {
+                            echo "✅ All commit messages contain a valid JIRA ticket with prefix: (${prefixes.join(', ')})"
+                        }
+                    }
+                }
+            }
+        }
+
+      stage('Code Coverage Check') {
+          when {
+              expression { env.CODE_COVERAGE_THRESHOLD.toInteger() != 0 }
+          }
+          steps {
+              script {
+                  try {
+                      if (env.language == 'java' || env.language == 'kotlin') {
+                          def coverageScript = load "ci-pr-gatekeeper/coverage/gradleCoverage.groovy"
+                          coverageScript.runCoverageCheck(env.CODE_COVERAGE_THRESHOLD, env.REPO_DIR)
+                      } else {
+                          def errorMsg = "❌ Unsupported language '${env.language}' for coverage check. Only 'java' and 'kotlin' are supported for now"
+                          currentBuild.description = errorMsg
+                          error errorMsg
+                      }
+                  } catch (Exception e) {
+                      echo "Coverage check failed: ${e.getMessage()}"
+                      def existingDescription = currentBuild.description ?: ''
+                      def errorMsg = "❌ Code coverage check failed or build failed, Required: '${env.CODE_COVERAGE_THRESHOLD}'%"
+                      currentBuild.description = errorMsg
+                      error errorMsg
+                  }
+              }
+          }
+      }
+  }
+
+    post {
+        always {
+            script {
+                def github = load 'ci-pr-gatekeeper/shared/github.groovy'
+                def state = currentBuild.result == 'SUCCESS' ? 'success' : 'failure'
+
+                def description
+                if (state == 'success') {
+                    description = 'All validations passed'
+                } else {
+                    // Use the captured error message or fallback to generic message
+                    description = currentBuild.description ?: '❌ Something failed unexpectedly, please check the build logs'
+                }
+
+                github.sendGitHubStatus(state, description)
+            }
+        }
+    }
+}
