@@ -15,7 +15,7 @@ pipeline {
     }
 
     environment {
-        DEFAULT_JIRA_PREFIX = 'SCS'
+        DEFAULT_JIRA_PREFIX = 'CPC'
         DEFAULT_CODE_COVERAGE_THRESHOLD = 0
         DEFAULT_LANGUAGE = 'kotlin'
         PATH = "$HOME/.local/bin:$PATH"
